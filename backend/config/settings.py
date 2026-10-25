@@ -15,6 +15,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
 ]
 
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
