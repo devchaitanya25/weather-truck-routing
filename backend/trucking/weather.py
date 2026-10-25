@@ -15,11 +15,12 @@ from datetime import datetime, timezone
 
 import requests
 from django.conf import settings
-
+from django.core.cache import cache
 from .errors import WeatherError
 
 CHUNK_SIZE = 50
-MAX_FORECAST_DAYS = 16
+FORECAST_DAYS = 11  # covers the 10-day departure limit plus the 48 h heatmap
+CACHE_SECONDS = 30 * 60
 
 Point = tuple[float, float]
 
@@ -91,7 +92,8 @@ def _fetch_chunk(points: list[Point], forecast_days: int) -> list[Forecast]:
     }
     headers = {"User-Agent": settings.HTTP_USER_AGENT}
     last_exc: Exception | None = None
-    for attempt in range(3):
+    delays = (2, 5, 10)
+    for attempt in range(len(delays) + 1):
         try:
             resp = requests.get(settings.OPEN_METEO_URL, params=params, headers=headers, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504):
@@ -103,7 +105,8 @@ def _fetch_chunk(points: list[Point], forecast_days: int) -> list[Forecast]:
             return [_parse_location(loc) for loc in locations]
         except (requests.RequestException, ValueError, KeyError, WeatherError) as exc:
             last_exc = exc
-            time.sleep(0.6 * (attempt + 1))
+            if attempt < len(delays):
+                time.sleep(delays[attempt])
     raise WeatherError(f"Weather service unavailable: {last_exc}")
 
 
@@ -111,18 +114,25 @@ def fetch_forecasts(
     points: list[Point], horizon_end_epoch: float, now_epoch: float | None = None
 ) -> dict[Point, Forecast]:
     """Fetch hourly forecasts for all points, covering up to horizon_end_epoch."""
-    now = now_epoch if now_epoch is not None else time.time()
-    today_start = now - (now % 86400)
-    days = math.ceil((horizon_end_epoch - today_start) / 86400)
-    forecast_days = min(MAX_FORECAST_DAYS, max(2, days))
-
-    chunks = [points[i : i + CHUNK_SIZE] for i in range(0, len(points), CHUNK_SIZE)]
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda c: _fetch_chunk(c, forecast_days), chunks))
+    forecast_days = FORECAST_DAYS
 
     out: dict[Point, Forecast] = {}
-    for chunk, forecasts in zip(chunks, results):
-        if len(forecasts) != len(chunk):
-            raise WeatherError("Weather service returned an unexpected number of locations.")
-        out.update(zip(chunk, forecasts))
+    missing: list[Point] = []
+    for p in points:
+        cached = cache.get(f"wx:{p[0]}:{p[1]}")
+        if cached is not None and cached.times[-1] >= horizon_end_epoch:
+            out[p] = cached
+        else:
+            missing.append(p)
+
+    if missing:
+        chunks = [missing[i : i + CHUNK_SIZE] for i in range(0, len(missing), CHUNK_SIZE)]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda c: _fetch_chunk(c, forecast_days), chunks))
+        for chunk, forecasts in zip(chunks, results):
+            if len(forecasts) != len(chunk):
+                raise WeatherError("Weather service returned an unexpected number of locations.")
+            for p, fc in zip(chunk, forecasts):
+                out[p] = fc
+                cache.set(f"wx:{p[0]}:{p[1]}", fc, CACHE_SECONDS)
     return out

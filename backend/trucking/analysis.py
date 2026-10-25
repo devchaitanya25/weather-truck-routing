@@ -11,8 +11,8 @@ from .geo import M_PER_MILE, Geometry
 from .risk import LEVEL_NAMES, classify
 
 HEAT_HOURS = 48
-HEAT_MAX_POINTS = 150
-HEAT_SPACING_MI = 25
+HEAT_MAX_POINTS = 60
+HEAT_SPACING_MI = 40
 SEGMENT_MAX_POINTS = 60
 
 
@@ -51,7 +51,7 @@ def _heat_points(routes: list[routing.Route]) -> list[weather.Point]:
     pts: set[weather.Point] = set()
     for r in routes:
         total = r.geometry.total_m
-        step = max(HEAT_SPACING_MI * M_PER_MILE, total / 50)
+        step = max(HEAT_SPACING_MI * M_PER_MILE, total / 25)
         for k in range(int(total // step) + 2):
             lat, lon, _ = r.geometry.locate(min(total, k * step))
             pts.add(weather.snap(lat, lon))
