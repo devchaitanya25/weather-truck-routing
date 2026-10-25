@@ -22,7 +22,6 @@ npm run dev                    # http://localhost:5173 (proxies /api to Django)
 ## Deploy (single container)
 
 The `Dockerfile` builds the React app and serves it from Django (WhiteNoise), so one service hosts everything.
-Render: *New → Blueprint* → pick this repo (`render.yaml` is included). Railway/Fly/Cloud Run work with the same Dockerfile.
 
 ## How it works
 
