@@ -25,14 +25,20 @@ The `Dockerfile` builds the React app and serves it from Django (WhiteNoise), so
 
 ## How it works
 
-`POST /api/analyze/` → `analysis.analyze()`:
+An analysis is three steps:
 
-1. **Routes** (`routing.py`): OSRM alternatives; if fewer than 3 distinct routes come back, extra ones are forced via sideways waypoints. Durations are scaled ×1.15 for truck speeds (OSRM public demo only has a car profile).
-2. **Checkpoints** (`analysis.py`): every 10/25/50 miles plus the destination. ETA = departure + cumulative route time at that distance.
-3. **Weather** (`weather.py`): Open-Meteo hourly wind/rain/snow in mph and inches, batched and fetched in parallel, linearly interpolated to each ETA.
-4. **Risk** (`risk.py`): table thresholds + load rules; the worst of wind/rain/snow sets the level.
-5. **Ranking** (`recommend.py`): No Travel miles → Severe miles → High miles → average risk → travel time.
-6. **Heatmap**: ~150 sample points along all routes × 49 hourly levels, sent once so the slider is instant (no requests while dragging).
+1. `POST /api/plan/` → `analysis.build_plan()`
+   - **Routes** (`routing.py`): OSRM alternatives; if fewer than 3 distinct routes come back, extra ones are forced via sideways waypoints. Durations are scaled ×1.15 for truck speeds (the OSRM public demo only has a car profile).
+   - **Checkpoints**: every 10/25/50 miles plus the destination. ETA = departure + cumulative route time at that distance.
+   - Returns the routes/checkpoints plus the list of weather points needed (checkpoints + a sampled heatmap corridor, snapped to a 0.1° grid).
+2. **Browser fetches weather** (`frontend/src/api.js`): hourly wind/rain/snow from Open-Meteo, in mph and inches, batched 50 points per request, with retry/backoff on 429 and a 30-minute in-memory cache. *Why in the browser:* Open-Meteo's free tier rate-limits by IP, and shared hosting IPs (e.g. Render's free tier) get HTTP 429. Fetching from each visitor's own IP avoids that.
+3. `POST /api/analyze/` with `{plan, weather}` → `analysis.evaluate()` — **all scoring stays in Django**:
+   - **Weather** (`weather.py`): payload validated, linearly interpolated to each checkpoint's ETA.
+   - **Risk** (`risk.py`): table thresholds + load rules; the worst of wind/rain/snow sets the level.
+   - **Ranking** (`recommend.py`): No Travel miles → Severe miles → High miles → average risk → travel time.
+   - **Heatmap**: ≤60 sample points along all routes × 49 hourly levels, sent once so the slider is instant (no requests while dragging).
+
+If `plan`/`weather` are omitted, `/api/analyze/` falls back to fetching weather server-side (`analysis.analyze()`), which works fine locally or on an unthrottled host.
 
 ## Assumptions / judgment calls
 
@@ -46,7 +52,8 @@ The `Dockerfile` builds the React app and serves it from Django (WhiteNoise), so
 
 - OSRM public demo is for light use and has no truck profile (no height/weight restrictions). Set `OSRM_BASE_URL` to your own server or swap in OpenRouteService `driving-hgv`.
 - Heatmap is sampled (~25 mi spacing), not a full grid.
-- Weather is pulled live per analysis; an in-memory cache is used only for geocoding.
+- The plan and weather are sent back to the server by the client (stateless server, no database). The server validates shapes but trusts the numbers, which is fine for a planning tool but would need signing for anything adversarial.
+- Weather is pulled live per analysis (cached 30 min in the browser); geocoding results are cached on the server.
 
 ## Layout
 

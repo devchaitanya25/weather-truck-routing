@@ -15,11 +15,18 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
 ]
 
+# Django's default ("same-origin") strips the Referer on cross-origin requests, and
+# OpenStreetMap's tile servers block requests without one.
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
+# The app is stateless: no database is needed.
 DATABASES = {}
+
+# The browser sends the plan plus hourly weather for a few hundred points back to /api/analyze/.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
 
 USE_TZ = True
 TIME_ZONE = "UTC"

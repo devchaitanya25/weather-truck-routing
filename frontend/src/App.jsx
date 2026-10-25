@@ -1,7 +1,15 @@
 import React, { useMemo, useState } from "react";
 import PlaceInput from "./PlaceInput.jsx";
 import MapView from "./MapView.jsx";
-import { LEVELS, analyze, fmtDuration, fmtTime, levelColor } from "./api.js";
+import {
+  LEVELS,
+  analyzeWithWeather,
+  fetchWeather,
+  fmtDuration,
+  fmtTime,
+  levelColor,
+  planTrip,
+} from "./api.js";
 
 // Default departure: next hour, formatted for <input type="datetime-local">.
 function defaultDeparture() {
@@ -18,6 +26,7 @@ export default function App() {
   const [load, setLoad] = useState(35000);
   const [interval, setIntervalMi] = useState(25);
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
@@ -42,13 +51,20 @@ export default function App() {
     setError("");
     setLoading(true);
     try {
-      const data = await analyze({
+      setStatus("Finding routes…");
+      const plan = await planTrip({
         origin,
         destination,
         departure: new Date(departure).toISOString(),
         load_lb: Number(load),
         interval_mi: Number(interval),
       });
+      setStatus("Fetching weather forecast…");
+      const weather = await fetchWeather(plan, (done, total) =>
+        setStatus(`Fetching weather forecast… ${done}/${total} locations`)
+      );
+      setStatus("Scoring risk…");
+      const data = await analyzeWithWeather(plan, weather);
       setResult(data);
       setSelectedId(data.recommendation.route_id);
       setHour(0);
@@ -103,7 +119,7 @@ export default function App() {
               </select>
             </label>
           </div>
-          <button disabled={loading}>{loading ? "Analyzing routes…" : "Find safest route"}</button>
+          <button disabled={loading}>{loading ? status || "Analyzing…" : "Find safest route"}</button>
         </form>
 
         {error && <div className="error">{error}</div>}

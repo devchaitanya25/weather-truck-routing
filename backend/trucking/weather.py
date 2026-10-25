@@ -16,11 +16,12 @@ from datetime import datetime, timezone
 import requests
 from django.conf import settings
 from django.core.cache import cache
+
 from .errors import WeatherError
 
 CHUNK_SIZE = 50
 FORECAST_DAYS = 11  # covers the 10-day departure limit plus the 48 h heatmap
-CACHE_SECONDS = 30 * 60
+CACHE_SECONDS = 30 * 60  # Open-Meteo refreshes its models about hourly
 
 Point = tuple[float, float]
 
@@ -28,6 +29,11 @@ Point = tuple[float, float]
 def snap(lat: float, lon: float) -> Point:
     """Snap to the 0.1 degree grid used as the weather cache key."""
     return round(lat, 1), round(lon, 1)
+
+
+def point_key(p: Point) -> str:
+    """Stable string id for a snapped point; shared by plan, browser and evaluation."""
+    return f"{p[0]:.1f},{p[1]:.1f}"
 
 
 @dataclass
@@ -61,6 +67,30 @@ class Forecast:
         return Sample(lerp(self.wind), lerp(self.rain), lerp(self.snow))
 
 
+MAX_PAYLOAD_HOURS = 600
+
+
+def forecast_from_payload(obj) -> Forecast:
+    """Validate and convert hourly weather sent by the browser.
+
+    Expected: {"start": epoch_s, "wind": [mph...], "rain": [in/hr...], "snow": [in/hr...]}
+    with one value per hour starting at `start`.
+    """
+    from .errors import ValidationError
+
+    try:
+        start = float(obj["start"])
+        wind, rain, snow = ([float(v) for v in obj[k]] for k in ("wind", "rain", "snow"))
+    except (KeyError, TypeError, ValueError):
+        raise ValidationError("Weather data is malformed.")
+    n = len(wind)
+    if not (2 <= n <= MAX_PAYLOAD_HOURS) or len(rain) != n or len(snow) != n:
+        raise ValidationError("Weather data has an invalid length.")
+    if not all(math.isfinite(v) and v >= 0 for v in wind + rain + snow) or not math.isfinite(start):
+        raise ValidationError("Weather data contains invalid values.")
+    return Forecast([start + i * 3600 for i in range(n)], wind, rain, snow)
+
+
 def _parse_location(loc: dict) -> Forecast:
     h, units = loc["hourly"], loc.get("hourly_units", {})
     times = [
@@ -92,7 +122,7 @@ def _fetch_chunk(points: list[Point], forecast_days: int) -> list[Forecast]:
     }
     headers = {"User-Agent": settings.HTTP_USER_AGENT}
     last_exc: Exception | None = None
-    delays = (2, 5, 10)
+    delays = (2, 5, 10)  # seconds to wait after a failed attempt (rate limits need real waits)
     for attempt in range(len(delays) + 1):
         try:
             resp = requests.get(settings.OPEN_METEO_URL, params=params, headers=headers, timeout=30)
@@ -114,6 +144,7 @@ def fetch_forecasts(
     points: list[Point], horizon_end_epoch: float, now_epoch: float | None = None
 ) -> dict[Point, Forecast]:
     """Fetch hourly forecasts for all points, covering up to horizon_end_epoch."""
+    # Always request the full forecast window so cached entries are reusable by any trip.
     forecast_days = FORECAST_DAYS
 
     out: dict[Point, Forecast] = {}
@@ -126,6 +157,7 @@ def fetch_forecasts(
             missing.append(p)
 
     if missing:
+        # Few, sequential requests: the free tier limits requests per minute per IP.
         chunks = [missing[i : i + CHUNK_SIZE] for i in range(0, len(missing), CHUNK_SIZE)]
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda c: _fetch_chunk(c, forecast_days), chunks))

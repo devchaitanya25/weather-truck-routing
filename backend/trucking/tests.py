@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from django.test import SimpleTestCase
 
 from . import recommend, routing, weather
-from .analysis import AnalysisRequest, Place, analyze, checkpoint_distances
+from .analysis import AnalysisRequest, Place, analyze, build_plan, checkpoint_distances, evaluate
 from .errors import ValidationError
 from .geo import M_PER_MILE, Geometry
 from .risk import HIGH, LOW, MODERATE, NO_TRAVEL, SEVERE, classify
@@ -105,6 +105,68 @@ class AnalysisTests(SimpleTestCase):
         r = _route("route-a", "Route A", [(40, -100), (40, -100.0001)], 1)
         with self.assertRaises(ValidationError):
             analyze(self.req, get_routes=lambda o, d: [r], fetch_forecasts=lambda *a: {})
+
+
+class PlanEvaluateTests(SimpleTestCase):
+    """The browser-weather flow: plan -> (JSON round trip + browser weather) -> evaluate."""
+
+    def setUp(self):
+        self.dep = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        self.req = AnalysisRequest(Place(40, -100), Place(40, -98.5), self.dep, 35_000, 25)
+        self.route = _route("route-a", "Route A", LINE, 7200)
+
+    def _plan(self):
+        import json
+
+        plan = build_plan(self.req, get_routes=lambda o, d: [self.route])
+        return json.loads(json.dumps(plan))  # what the browser sends back
+
+    def _weather(self, plan, wind):
+        start = plan["window"]["start"]
+        return {
+            p["key"]: weather.forecast_from_payload(
+                {"start": start, "wind": [wind] * 100, "rain": [0] * 100, "snow": [0] * 100}
+            )
+            for p in plan["weather_points"]
+        }
+
+    def test_plan_lists_every_needed_weather_point(self):
+        plan = self._plan()
+        keys = {p["key"] for p in plan["weather_points"]}
+        for cp in plan["routes"][0]["checkpoints"]:
+            self.assertIn(cp["key"], keys)
+        self.assertTrue(set(plan["heat_keys"]) <= keys)
+        self.assertLess(plan["window"]["start"], plan["request"]["departure_epoch"])
+        self.assertGreaterEqual(plan["window"]["end"], plan["request"]["departure_epoch"] + 48 * 3600)
+
+    def test_load_changes_result_without_refetching_weather(self):
+        plan = self._plan()
+        fc = self._weather(plan, wind=50.0)
+        heavy = evaluate(plan, fc)["routes"][0]
+        self.assertFalse(heavy["drivable"])  # 50 mph with 35,000 lb -> No Travel
+        plan["request"]["load_lb"] = 20_000
+        light = evaluate(plan, fc)["routes"][0]
+        self.assertEqual(light["miles_by_level"]["No Travel"], 0)
+        self.assertGreater(light["miles_by_level"]["Severe"], 0)
+
+    def test_segments_cover_route_and_heatmap_complete(self):
+        plan = self._plan()
+        res = evaluate(plan, self._weather(plan, wind=5.0))
+        route = res["routes"][0]
+        self.assertAlmostEqual(sum(route["miles_by_level"].values()), route["distance_mi"], delta=0.5)
+        self.assertEqual(len(route["segments"]), 1)  # all Low -> one merged segment
+        self.assertTrue(all(len(p[2]) == 49 for p in res["heatmap"]["points"]))
+
+    def test_missing_or_bad_weather_rejected(self):
+        plan = self._plan()
+        with self.assertRaises(ValidationError):
+            evaluate(plan, {})
+        with self.assertRaises(ValidationError):
+            weather.forecast_from_payload({"start": 0, "wind": [1], "rain": [1], "snow": [1]})
+        with self.assertRaises(ValidationError):
+            weather.forecast_from_payload({"start": 0, "wind": [-1, 2], "rain": [0, 0], "snow": [0, 0]})
+        with self.assertRaises(ValidationError):
+            evaluate({"request": {}}, {})
 
 
 class RankingTests(SimpleTestCase):

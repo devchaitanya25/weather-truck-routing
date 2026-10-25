@@ -9,9 +9,11 @@ from django.http import JsonResponse
 from django.views.decorators.http import require_GET, require_POST
 
 from . import geocoding
-from .analysis import AnalysisRequest, Place, analyze
+from .analysis import AnalysisRequest, Place, analyze, build_plan, evaluate
 from .errors import ApiError, ValidationError
+from .weather import forecast_from_payload
 
+MAX_WEATHER_POINTS = 800
 ALLOWED_INTERVALS = (10, 25, 50)
 MAX_LOAD_LB = 150_000
 MAX_DAYS_AHEAD = 10
@@ -85,15 +87,45 @@ def geocode(request):
     return JsonResponse({"results": results})
 
 
+def _json_body(request) -> dict:
+    try:
+        body = json.loads(request.body or b"{}")
+    except ValueError:
+        raise ValidationError("Request body must be valid JSON.")
+    if not isinstance(body, dict):
+        raise ValidationError("Request body must be a JSON object.")
+    return body
+
+
+@require_POST
+def plan_view(request):
+    """Step 1: routes, checkpoints, ETAs and the weather points the browser must fetch."""
+    try:
+        return JsonResponse(build_plan(parse_request(_json_body(request))))
+    except ApiError as exc:
+        return _error(exc)
+
+
 @require_POST
 def analyze_view(request):
+    """Step 2: score a plan against weather supplied by the browser.
+
+    Without `plan`/`weather` in the body, falls back to fetching weather server-side.
+    """
     t0 = time.perf_counter()
     try:
-        try:
-            body = json.loads(request.body or b"{}")
-        except ValueError:
-            raise ValidationError("Request body must be valid JSON.")
-        result = analyze(parse_request(body))
+        body = _json_body(request)
+        if "plan" in body:
+            weather_in = body.get("weather")
+            if not isinstance(weather_in, dict) or len(weather_in) > MAX_WEATHER_POINTS:
+                raise ValidationError("'weather' must be an object keyed by point.")
+            forecasts = {k: forecast_from_payload(v) for k, v in weather_in.items()}
+            plan = body["plan"]
+            if not isinstance(plan, dict):
+                raise ValidationError("'plan' must be an object.")
+            result = evaluate(plan, forecasts)
+        else:
+            result = analyze(parse_request(body))
     except ApiError as exc:
         return _error(exc)
     result["elapsed_ms"] = round((time.perf_counter() - t0) * 1000)

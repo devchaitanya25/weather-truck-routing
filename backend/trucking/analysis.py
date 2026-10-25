@@ -1,4 +1,12 @@
-"""Orchestrates one analysis: routes -> checkpoints -> weather -> risk -> ranking -> heatmap."""
+"""One analysis, in two steps so weather can come from the browser.
+
+build_plan()  - routes, checkpoints (with ETAs), and the list of weather points needed.
+evaluate()    - given forecasts for those points, scores risk, ranks routes, builds the heatmap.
+
+analyze() runs both with server-side weather (used by tests and local use).
+In production the browser fetches the weather itself (see frontend/src/api.js), because
+Open-Meteo's free tier rate-limits shared hosting IPs.
+"""
 from __future__ import annotations
 
 import math
@@ -7,13 +15,12 @@ from datetime import datetime, timezone
 
 from . import recommend, routing, weather
 from .errors import ValidationError
-from .geo import M_PER_MILE, Geometry
+from .geo import M_PER_MILE
 from .risk import LEVEL_NAMES, classify
 
 HEAT_HOURS = 48
 HEAT_MAX_POINTS = 60
 HEAT_SPACING_MI = 40
-SEGMENT_MAX_POINTS = 60
 
 
 @dataclass(frozen=True)
@@ -62,38 +69,107 @@ def _heat_points(routes: list[routing.Route]) -> list[weather.Point]:
     return ordered
 
 
-def _plan(route: routing.Route, interval_mi: int, dep: float) -> list[dict]:
-    g: Geometry = route.geometry
-    ds = checkpoint_distances(g.total_m, interval_mi)
-    cps = []
-    for i, d in enumerate(ds):
-        lat, lon, secs = g.locate(d)
-        start = (ds[i - 1] + d) / 2 if i > 0 else 0.0
-        end = (d + ds[i + 1]) / 2 if i < len(ds) - 1 else g.total_m
-        cps.append({"d": d, "lat": lat, "lon": lon, "eta": dep + secs, "start": start, "end": end})
-    return cps
+# ----------------------------------------------------------------------------- step 1
 
 
-def _build_route(route, cps, forecasts, load_lb, dep, notes: set[str]) -> dict:
-    g = route.geometry
+def build_plan(req: AnalysisRequest, *, get_routes=routing.get_routes) -> dict:
+    """Everything that does not depend on weather. The result is plain JSON."""
+    routes = get_routes((req.origin.lat, req.origin.lng), (req.destination.lat, req.destination.lng))
+    if not routes or routes[0].geometry.total_m < 0.5 * M_PER_MILE:
+        raise ValidationError("Origin and destination are too close together to route.")
+
+    dep = req.departure.timestamp()
+    horizon = dep + HEAT_HOURS * 3600
+    needed: dict[str, weather.Point] = {}
+
+    def register(lat: float, lon: float) -> str:
+        p = weather.snap(lat, lon)
+        key = weather.point_key(p)
+        needed[key] = p
+        return key
+
+    plan_routes = []
+    for r in routes:
+        g = r.geometry
+        ds = checkpoint_distances(g.total_m, req.interval_mi)
+        cps = []
+        for i, d in enumerate(ds):
+            lat, lon, secs = g.locate(d)
+            start = (ds[i - 1] + d) / 2 if i > 0 else 0.0
+            end = (d + ds[i + 1]) / 2 if i < len(ds) - 1 else g.total_m
+            eta = dep + secs
+            horizon = max(horizon, eta)
+            span_mi = (end - start) / M_PER_MILE
+            max_pts = int(min(60, max(8, round(span_mi * 1.2))))
+            cps.append({
+                "mile_m": d,
+                "lat": round(lat, 5),
+                "lon": round(lon, 5),
+                "eta": eta,
+                "start_m": start,
+                "end_m": end,
+                "key": register(lat, lon),
+                "path": [[round(a, 5), round(b, 5)] for a, b in g.slice(start, end, max_pts)],
+            })
+        plan_routes.append({
+            "id": r.id, "label": r.label, "via": r.via,
+            "total_m": g.total_m, "total_s": g.total_s, "checkpoints": cps,
+        })
+
+    heat_keys = [register(*p) for p in _heat_points(routes)]
+
+    return {
+        "request": {
+            "origin": req.origin.__dict__,
+            "destination": req.destination.__dict__,
+            "departure": _iso(dep),
+            "departure_epoch": dep,
+            "load_lb": req.load_lb,
+            "interval_mi": req.interval_mi,
+        },
+        "routes": plan_routes,
+        "heat_keys": heat_keys,
+        # Hourly weather is needed for every point between window.start and window.end (epoch s).
+        "window": {
+            "start": int(dep // 3600 * 3600) - 3600,
+            "end": int(math.ceil(horizon / 3600) * 3600) + 3600,
+        },
+        "weather_points": [
+            {"key": k, "lat": p[0], "lon": p[1]} for k, p in sorted(needed.items())
+        ],
+    }
+
+
+# ----------------------------------------------------------------------------- step 2
+
+
+def _forecast(forecasts: dict[str, weather.Forecast], key: str) -> weather.Forecast:
+    try:
+        return forecasts[key]
+    except KeyError:
+        raise ValidationError(f"Missing weather data for point {key}.")
+
+
+def _build_route(r: dict, forecasts, load_lb: float, dep: float, notes: set[str]) -> dict:
+    total_m, total_s = float(r["total_m"]), float(r["total_s"])
     miles_by_level = [0.0] * 5
     weighted = 0.0
     checkpoints, segments = [], []
 
-    for i, cp in enumerate(cps):
-        sample = forecasts[weather.snap(cp["lat"], cp["lon"])].at(cp["eta"])
+    for i, cp in enumerate(r["checkpoints"]):
+        sample = _forecast(forecasts, cp["key"]).at(cp["eta"])
         if sample.beyond_forecast:
             notes.add("Some ETAs fall beyond the available forecast; the last forecast hour was used.")
         a = classify(sample.wind_mph, sample.rain_in_hr, sample.snow_in_hr, load_lb)
-        span_m = cp["end"] - cp["start"]
+        span_m = cp["end_m"] - cp["start_m"]
         miles_by_level[a.level] += span_m / M_PER_MILE
         weighted += a.level * span_m
 
         checkpoints.append({
             "index": i,
-            "mile": round(cp["d"] / M_PER_MILE, 1),
-            "lat": round(cp["lat"], 5),
-            "lon": round(cp["lon"], 5),
+            "mile": round(cp["mile_m"] / M_PER_MILE, 1),
+            "lat": cp["lat"],
+            "lon": cp["lon"],
             "eta": _iso(cp["eta"]),
             "weather": {
                 "wind_mph": round(sample.wind_mph, 1),
@@ -107,27 +183,23 @@ def _build_route(route, cps, forecasts, load_lb, dep, notes: set[str]) -> dict:
         })
 
         # Merge consecutive spans of the same level into one colored segment.
+        path = [list(p) for p in cp["path"]]
         if segments and segments[-1]["level"] == a.level:
-            segments[-1]["end_m"] = cp["end"]
+            segments[-1]["path"].extend(path[1:])
         else:
-            segments.append({"level": a.level, "start_m": cp["start"], "end_m": cp["end"]})
+            segments.append({"level": a.level, "path": path})
 
-    for seg in segments:
-        seg["path"] = g.slice(seg.pop("start_m"), seg.pop("end_m"), SEGMENT_MAX_POINTS)
-
-    total_m = g.total_m
-    avg_risk = weighted / total_m if total_m else 0.0
     named = {LEVEL_NAMES[i]: round(miles_by_level[i], 1) for i in range(5)}
     return {
-        "id": route.id,
-        "label": route.label,
-        "via": route.via,
+        "id": r["id"],
+        "label": r["label"],
+        "via": r["via"],
         "distance_mi": round(total_m / M_PER_MILE, 1),
-        "duration_s": round(g.total_s),
+        "duration_s": round(total_s),
         "departure": _iso(dep),
-        "arrival": _iso(dep + g.total_s),
+        "arrival": _iso(dep + total_s),
         "miles_by_level": named,
-        "avg_risk": round(avg_risk, 3),
+        "avg_risk": round(weighted / total_m if total_m else 0.0, 3),
         "max_level": max(c["level"] for c in checkpoints),
         "drivable": named["No Travel"] < 0.5,
         "checkpoints": checkpoints,
@@ -135,16 +207,42 @@ def _build_route(route, cps, forecasts, load_lb, dep, notes: set[str]) -> dict:
     }
 
 
-def _build_heatmap(points, forecasts, load_lb, dep) -> dict:
+def _build_heatmap(plan: dict, forecasts, load_lb: float, dep: float) -> dict:
+    coords = {p["key"]: (p["lat"], p["lon"]) for p in plan["weather_points"]}
     rows = []
-    for p in points:
-        fc = forecasts[p]
+    for key in plan["heat_keys"]:
+        fc = _forecast(forecasts, key)
         levels = []
         for h in range(HEAT_HOURS + 1):
             s = fc.at(dep + h * 3600)
             levels.append(classify(s.wind_mph, s.rain_in_hr, s.snow_in_hr, load_lb).level)
-        rows.append([p[0], p[1], levels])
+        lat, lon = coords[key]
+        rows.append([lat, lon, levels])
     return {"start": _iso(dep), "hours": HEAT_HOURS, "points": rows}
+
+
+def evaluate(plan: dict, forecasts: dict[str, weather.Forecast]) -> dict:
+    """Score a plan against forecasts keyed by point key."""
+    try:
+        req = plan["request"]
+        load_lb = float(req["load_lb"])
+        dep = float(req["departure_epoch"])
+        notes: set[str] = set()
+        results = [_build_route(r, forecasts, load_lb, dep, notes) for r in plan["routes"]]
+        if not results:
+            raise ValidationError("Plan contains no routes.")
+        heatmap = _build_heatmap(plan, forecasts, load_lb, dep)
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise ValidationError(f"Invalid plan data: {exc!r}")
+
+    ranked = recommend.rank_routes(results)
+    return {
+        "request": {k: req[k] for k in ("origin", "destination", "departure", "load_lb", "interval_mi")},
+        "routes": results,  # original (fastest-first) order; `rank` marks the best
+        "recommendation": recommend.explain(ranked),
+        "heatmap": heatmap,
+        "notes": sorted(notes),
+    }
 
 
 def analyze(
@@ -153,39 +251,9 @@ def analyze(
     get_routes=routing.get_routes,
     fetch_forecasts=weather.fetch_forecasts,
 ) -> dict:
-    routes = get_routes((req.origin.lat, req.origin.lng), (req.destination.lat, req.destination.lng))
-    if not routes or routes[0].geometry.total_m < 0.5 * M_PER_MILE:
-        raise ValidationError("Origin and destination are too close together to route.")
-
-    dep = req.departure.timestamp()
-    plans = {r.id: _plan(r, req.interval_mi, dep) for r in routes}
-    heat_pts = _heat_points(routes)
-
-    needed = set(heat_pts)
-    horizon = dep + HEAT_HOURS * 3600
-    for cps in plans.values():
-        for cp in cps:
-            needed.add(weather.snap(cp["lat"], cp["lon"]))
-            horizon = max(horizon, cp["eta"])
-    forecasts = fetch_forecasts(sorted(needed), horizon)
-
-    notes: set[str] = set()
-    results = [
-        _build_route(r, plans[r.id], forecasts, req.load_lb, dep, notes) for r in routes
-    ]
-    ranked = recommend.rank_routes(results)
-    recommendation = recommend.explain(ranked)
-
-    return {
-        "request": {
-            "origin": req.origin.__dict__,
-            "destination": req.destination.__dict__,
-            "departure": _iso(dep),
-            "load_lb": req.load_lb,
-            "interval_mi": req.interval_mi,
-        },
-        "routes": results,  # original (fastest-first) order; `rank` marks the best
-        "recommendation": recommendation,
-        "heatmap": _build_heatmap(heat_pts, forecasts, req.load_lb, dep),
-        "notes": sorted(notes),
-    }
+    """Plan + server-side weather + evaluate (tests, local use)."""
+    plan = build_plan(req, get_routes=get_routes)
+    points = [(p["lat"], p["lon"]) for p in plan["weather_points"]]
+    fetched = fetch_forecasts(points, plan["window"]["end"])
+    forecasts = {weather.point_key(p): fc for p, fc in fetched.items()}
+    return evaluate(plan, forecasts)
